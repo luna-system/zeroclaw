@@ -545,6 +545,7 @@ struct StreamedChatOutcome {
     response_text: String,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
+    reasoning_content: Option<String>,
 }
 
 async fn consume_provider_streaming_response(
@@ -597,39 +598,46 @@ async fn consume_provider_streaming_response(
                 // do not affect the agent's tool dispatch loop.
             }
             StreamEvent::TextDelta(chunk) => {
-                if chunk.delta.is_empty() {
+                if chunk.delta.is_empty() && chunk.reasoning.is_none() {
                     continue;
                 }
 
-                outcome.response_text.push_str(&chunk.delta);
-                marker_window.push_str(&chunk.delta);
-
-                if marker_window.len() > STREAM_TOOL_MARKER_WINDOW_CHARS {
-                    let keep_from = marker_window.len() - STREAM_TOOL_MARKER_WINDOW_CHARS;
-                    let boundary = marker_window
-                        .char_indices()
-                        .find(|(idx, _)| *idx >= keep_from)
-                        .map_or(0, |(idx, _)| idx);
-                    marker_window.drain(..boundary);
+                if let Some(reasoning) = &chunk.reasoning {
+                    let rc = outcome.reasoning_content.get_or_insert_with(String::new);
+                    rc.push_str(reasoning);
                 }
 
-                if !suppress_forwarding && {
-                    let lowered = marker_window.to_ascii_lowercase();
-                    lowered.contains("<tool_call")
-                        || lowered.contains("<toolcall")
-                        || lowered.contains("\"tool_calls\"")
-                } {
-                    suppress_forwarding = true;
-                }
+                if !chunk.delta.is_empty() {
+                    outcome.response_text.push_str(&chunk.delta);
+                    marker_window.push_str(&chunk.delta);
 
-                if suppress_forwarding {
-                    continue;
-                }
+                    if marker_window.len() > STREAM_TOOL_MARKER_WINDOW_CHARS {
+                        let keep_from = marker_window.len() - STREAM_TOOL_MARKER_WINDOW_CHARS;
+                        let boundary = marker_window
+                            .char_indices()
+                            .find(|(idx, _)| *idx >= keep_from)
+                            .map_or(0, |(idx, _)| idx);
+                        marker_window.drain(..boundary);
+                    }
 
-                if let Some(tx) = delta_sender {
-                    outcome.forwarded_live_deltas = true;
-                    if tx.send(StreamDelta::Text(chunk.delta)).await.is_err() {
-                        delta_sender = None;
+                    if !suppress_forwarding && {
+                        let lowered = marker_window.to_ascii_lowercase();
+                        lowered.contains("<tool_call")
+                            || lowered.contains("<toolcall")
+                            || lowered.contains("\"tool_calls\"")
+                    } {
+                        suppress_forwarding = true;
+                    }
+
+                    if suppress_forwarding {
+                        continue;
+                    }
+
+                    if let Some(tx) = delta_sender {
+                        outcome.forwarded_live_deltas = true;
+                        if tx.send(StreamDelta::Text(chunk.delta)).await.is_err() {
+                            delta_sender = None;
+                        }
                     }
                 }
             }
@@ -1124,7 +1132,7 @@ pub async fn run_tool_call_loop(
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
                         usage: None,
-                        reasoning_content: None,
+                        reasoning_content: streamed.reasoning_content,
                     })
                 }
                 Err(stream_err) => {
@@ -7004,6 +7012,183 @@ Let me check the result."#;
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    // ── Streaming reasoning_content preservation tests ────────────────────────
+
+    struct MultiTurnReasoningStreamingProvider {
+        turns: Arc<Mutex<VecDeque<Vec<zeroclaw_providers::traits::StreamResult<StreamEvent>>>>>,
+        stream_calls: Arc<AtomicUsize>,
+    }
+
+    impl MultiTurnReasoningStreamingProvider {
+        fn new(turns: Vec<Vec<zeroclaw_providers::traits::StreamResult<StreamEvent>>>) -> Self {
+            Self {
+                turns: Arc::new(Mutex::new(turns.into())),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for MultiTurnReasoningStreamingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("should not be called")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("should not be called")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<StreamEvent>,
+        > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if !options.enabled {
+                return Box::pin(futures_util::stream::empty());
+            }
+
+            let turn = self
+                .turns
+                .lock()
+                .expect("turns lock should be valid")
+                .pop_front()
+                .expect("should have scripted turns remaining");
+
+            Box::pin(futures_util::stream::iter(turn))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_reasoning_content_in_streaming_tool_calls() {
+        let provider = MultiTurnReasoningStreamingProvider::new(vec![
+            vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                    "Let me think about this...",
+                ))),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                    "I will check the file",
+                ))),
+                Ok(StreamEvent::ToolCall(ToolCall {
+                    id: "call_1".into(),
+                    name: "file_read".into(),
+                    arguments: r#"{"path":"/tmp/test.txt"}"#.into(),
+                })),
+                Ok(StreamEvent::Final),
+            ],
+            vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("File contents are ok"))),
+                Ok(StreamEvent::Final),
+            ],
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "file_read",
+            Arc::new(AtomicUsize::new(0)),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("read the file"),
+        ];
+        let observer = NoopObserver;
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("reasoning streaming should complete");
+
+        assert_eq!(result, "I will check the fileFile contents are ok");
+
+        // Find the assistant message with tool calls in history
+        let assistant_msg = history
+            .iter()
+            .find(|msg| {
+                msg.role == "assistant"
+                    && serde_json::from_str::<serde_json::Value>(&msg.content)
+                        .is_ok_and(|v| v.get("tool_calls").is_some())
+            })
+            .expect("should have assistant message with tool_calls");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&assistant_msg.content).expect("should be valid JSON");
+
+        assert_eq!(
+            parsed["reasoning_content"].as_str(),
+            Some("Let me think about this..."),
+            "assistant history should preserve reasoning_content from streaming"
+        );
+        assert_eq!(
+            parsed["content"].as_str(),
+            Some("I will check the file"),
+            "assistant history should preserve content from streaming"
+        );
+        assert!(
+            parsed["tool_calls"].is_array(),
+            "assistant history should include tool_calls"
+        );
     }
 
     // ── glob_match tests ──────────────────────────────────────────────────────
